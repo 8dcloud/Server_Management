@@ -1,39 +1,91 @@
 #!/usr/bin/env bash
-# setup_varsync.sh — Configure daily rsync of /var -> /varbak with systemd + logrotate
-# Usage: sudo ./setup_varsync.sh
+# =============================================================================
+# Component:   setup_varsync.sh
+# Description: Configure daily rsync from /var → /varbak using systemd + logrotate
+# File Path:   scripts/setup_varsync.sh
+# Created:     2025-08-20
+# Maintainer:  8Dweb Ops (Matthew J. Sine)
+# Version:     1.1.0
+#
+# Features:
+#   - Creates systemd service (var-sync.service) and timer (var-sync.timer)
+#   - Runs daily at 01:00 local time (Persistent=true catchup)
+#   - Appends run output to /var/log/varsync.log + keeps journal logs
+#   - Logrotate policy: daily, 14 copies, gzip, su root:adm
+#   - Tightens /var/log permissions if too loose (required by logrotate)
+#   - Excludes common churn/bulk paths under /var (cache, tmp, Docker, Snap)
+#   - Safe to re-run (idempotent)
+#
+# Dependencies:
+#   - Ubuntu 24.04+ (systemd, logrotate present by default)
+#   - rsync (apt install rsync)
+#
+# Usage:
+#   sudo bash scripts/setup_varsync.sh
+#
+# Uninstall:
+#   sudo systemctl disable --now var-sync.timer
+#   sudo rm -f /etc/systemd/system/var-sync.timer /etc/systemd/system/var-sync.service
+#   sudo systemctl daemon-reload
+#   sudo rm -f /etc/logrotate.d/varsync /var/log/varsync.log
+#
+# =============================================================================
+
 set -euo pipefail
 
-SRC="/var/"
-DST="/varbak/"
+# -----------------------------
+# Tunables
+# -----------------------------
+SRC="/var/"          # Trailing slash => copy contents of /var
+DST="/varbak/"       # Ensure this is on the target partition
 LOG="/var/log/varsync.log"
 SERVICE="/etc/systemd/system/var-sync.service"
 TIMER="/etc/systemd/system/var-sync.timer"
 LOGROTATE="/etc/logrotate.d/varsync"
 
-RSYNC_BIN="$(command -v rsync || true)"
-if [[ -z "$RSYNC_BIN" ]]; then
+# -----------------------------
+# Pre-flight checks
+# -----------------------------
+if ! command -v rsync >/dev/null 2>&1; then
   echo "ERROR: rsync not found. Install it: sudo apt-get update && sudo apt-get install -y rsync"
   exit 1
 fi
 
-# 1) Ensure destination exists
+# Ensure destination exists (does not create/mount a partition; assumes /varbak is ready)
 mkdir -p "$DST"
 
-# 2) Write systemd service
+# -----------------------------
+# Write systemd service unit
+# -----------------------------
 cat > "$SERVICE" <<'EOF'
 [Unit]
 Description=Sync /var to /varbak
+# Ensures source/destination are mounted before this runs
 RequiresMountsFor=/var /varbak
+# Only run if destination directory exists
 ConditionPathIsDirectory=/varbak
 
 [Service]
 Type=oneshot
+# Be nice to CPU and disks
 Nice=10
 IOSchedulingClass=idle
+
+# Ensure target exists (idempotent)
 ExecStartPre=/usr/bin/mkdir -p /varbak
-# Mark start time (ISO-8601) in logfile
+
+# Mark start time in the log (ISO-8601)
 ExecStartPre=/usr/bin/bash -lc 'echo "--- [$(date -Is)] var-sync START ---" >> /var/log/varsync.log'
-# The rsync itself (tune excludes as needed)
+
+# The sync (key flags explained):
+#   -aAXH        archive + ACLs + xattrs + hardlinks
+#   --numeric-ids preserve numeric IDs (avoid username lookups)
+#   -x           do not cross filesystem boundaries (stay on /var)
+#   --delete-delay defer deletions to end for safety during churn
+#   --partial --inplace better for large files and restarts
+#   --info=stats2,progress2 concise progress + end stats
+#   --human-readable human-friendly byte units
+#   Excludes: cache/tmp/docker/snap (reduce churn and bulk)
 ExecStart=/usr/bin/rsync -aAXH --numeric-ids -x \
   --delete-delay --partial --inplace \
   --info=stats2,progress2 --human-readable \
@@ -43,15 +95,18 @@ ExecStart=/usr/bin/rsync -aAXH --numeric-ids -x \
   --exclude='/snap/***' \
   --exclude='/lib/snapd/***' \
   /var/ /varbak/
-# Mark end time in logfile
+
+# Mark end time & exit code
 ExecStartPost=/usr/bin/bash -lc 'echo "--- [$(date -Is)] var-sync END (code=$?) ---" >> /var/log/varsync.log'
 
-# Append stdout/stderr to file (also still goes to journal)
+# Append both stdout/stderr to a persistent logfile (still goes to journal)
 StandardOutput=append:/var/log/varsync.log
 StandardError=append:/var/log/varsync.log
 EOF
 
-# 3) Write systemd timer (daily at 1:00 AM)
+# -----------------------------
+# Write systemd timer (daily 01:00)
+# -----------------------------
 cat > "$TIMER" <<'EOF'
 [Unit]
 Description=Run var-sync daily at 1:00 AM
@@ -65,23 +120,33 @@ AccuracySec=1m
 WantedBy=timers.target
 EOF
 
-# 4) Ensure logfile exists with sane permissions
+# -----------------------------
+# Ensure logfile exists with sane perms
+#   - owner root:adm
+#   - mode 0640
+#   (journal still captures output regardless)
+# -----------------------------
 touch "$LOG"
 chown root:adm "$LOG"
 chmod 0640 "$LOG"
 
-# 5) Fix /var/log permissions if too loose (Ubuntu default: 0755, root:syslog)
-# Only tighten perms; do not change owner if already correct.
-owner_group="$(stat -c '%U:%G' /var/log || true)"
-perms="$(stat -c '%a' /var/log || true)"
-if [[ "${perms}" -gt 755 ]]; then
+# -----------------------------
+# Tighten /var/log directory perms if needed
+# logrotate refuses insecure parents (must not be group-writable)
+# Ubuntu default: drwxr-xr-x root:syslog (0755)
+# -----------------------------
+# Remove group write if present
+chmod g-w /var/log || true
+# Ensure directory is at most 0755 (avoid 0775/0777)
+current_mode="$(stat -c '%a' /var/log)"
+if [ "$current_mode" -gt 755 ]; then
   chmod 0755 /var/log
 fi
-# If group isn't syslog, leave it—Ubuntu uses root:syslog by default, but root:root is also fine.
-# Ensure not group-writable:
-chmod g-w /var/log || true
+# Note: owner/group may be root:syslog or root:root; both are acceptable here.
 
-# 6) Logrotate config
+# -----------------------------
+# Install logrotate policy
+# -----------------------------
 cat > "$LOGROTATE" <<'EOF'
 /var/log/varsync.log {
     su root adm
@@ -95,20 +160,26 @@ cat > "$LOGROTATE" <<'EOF'
 }
 EOF
 
-# 7) Reload systemd and enable timer
+# -----------------------------
+# Reload systemd and enable timer
+# -----------------------------
 systemctl daemon-reload
 systemctl enable --now var-sync.timer
 
-# 8) Optional: run one initial sync now to verify
+# -----------------------------
+# Kick an initial run (on-demand) to verify & show logs
+# -----------------------------
 echo "Running an initial sync now..."
 if systemctl start var-sync.service; then
-  echo "Initial sync triggered. Tail of log:"
-  tail -n 50 /var/log/varsync.log || true
+  echo "Initial sync started. Recent log output:"
+  tail -n 50 "$LOG" || true
 else
   echo "WARNING: var-sync.service start returned non-zero; check: journalctl -u var-sync.service"
 fi
 
-# 9) Show next scheduled run
+# -----------------------------
+# Show next scheduled run (for operator sanity)
+# -----------------------------
 echo
 echo "Timer status:"
 systemctl list-timers var-sync.timer || true
@@ -120,6 +191,7 @@ echo "• Timer:     $TIMER"
 echo "• Log file:  $LOG  (rotated daily, 14 copies)"
 echo
 echo "Useful commands:"
+echo "  systemctl start var-sync.service          # run on demand"
+echo "  systemctl status var-sync.service"
 echo "  journalctl -u var-sync.service --since 'today'"
-echo "  tail -n 100 /var/log/varsync.log"
-echo "  systemctl start var-sync.service   # run on-demand"
+echo "  tail -n 100 $LOG"
